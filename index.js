@@ -5,9 +5,11 @@ const path = require('path');
 const mega = require('megajs');
 const fetch = require('node-fetch');
 const express = require('express');
+const pTimeout = require('p-timeout');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const DOWNLOAD_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -18,7 +20,6 @@ const storage = mega({
   autoload: true
 });
 
-// Log Mega connection status
 storage.on('ready', () => {
   console.log('Connected to Mega account successfully');
 });
@@ -26,11 +27,12 @@ storage.on('error', (error) => {
   console.error('Error connecting to Mega:', error);
 });
 
-// Helper function to download file from URL
+// Helper function to download file with a longer timeout
 async function downloadFile(fileLink, destPath) {
   try {
-    const response = await fetch(fileLink);
+    const response = await pTimeout(fetch(fileLink), DOWNLOAD_TIMEOUT, 'Download timed out.');
     if (!response.ok) throw new Error(`Failed to fetch file: ${response.statusText}`);
+    
     const fileStream = fs.createWriteStream(destPath);
     response.body.pipe(fileStream);
     await new Promise((resolve, reject) => {
@@ -63,74 +65,58 @@ async function uploadToMega(localFilePath, fileName) {
 }
 
 // Bot start command
-bot.start((ctx) => ctx.reply('Welcome! Send me a file under 20MB to upload to Mega, or send a direct download link for larger files (up to 2GB).'));
+bot.start((ctx) => ctx.reply('Welcome! Send a file under 20MB or a direct download link for larger files.'));
 
-// Handle files and check size
+// Handle document uploads
 bot.on('document', async (ctx) => {
   const fileId = ctx.message.document.file_id;
   const fileName = ctx.message.document.file_name;
   const fileSize = ctx.message.document.file_size;
 
-  if (fileSize > 20 * 1024 * 1024) { // 20MB limit for Telegram API
-    return ctx.reply('This file is over 20MB. Please send a direct download link (from Google Drive, Dropbox, etc.) instead.');
+  if (fileSize > 20 * 1024 * 1024) {
+    return ctx.reply('File is over 20MB. Please send a direct download link instead.');
   }
 
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
     const localPath = path.join(__dirname, fileName);
 
-    // Download the file from Telegram
     await downloadFile(fileLink, localPath);
-
-    // Upload to Mega
     const megaLink = await uploadToMega(localPath, fileName);
 
-    // Clean up local file
     fs.unlinkSync(localPath);
-    console.log('Local file deleted after upload.');
-
-    // Send Mega link to user
     ctx.reply(`File uploaded to Mega: ${megaLink}`);
   } catch (error) {
-    console.error('Error handling file:', error);
-    ctx.reply('There was an error uploading your file to Mega. Please try again later.');
+    ctx.reply('Error uploading your file. Try again later.');
   }
 });
 
-// Handle links for files larger than 20MB
+// Handle text links for large files
 bot.on('text', async (ctx) => {
-  const text = ctx.message.text;
+  const url = ctx.message.text;
 
-  // Validate URL format
-  const urlRegex = /^(ftp|http|https):\/\/[^ "]+$/;
-  if (!urlRegex.test(text)) {
-    return ctx.reply('Please send a valid direct download link (URL).');
+  const urlPattern = /^(ftp|http|https):\/\/[^ "]+$/;
+  if (!urlPattern.test(url)) {
+    return ctx.reply('Please send a valid download link.');
   }
 
-  // File name extraction and local path setup
-  const fileName = `file_${Date.now()}.bin`; // Use timestamp as filename
+  const fileName = `file_${Date.now()}.bin`;
   const localPath = path.join(__dirname, fileName);
 
   try {
-    // Download the file from the provided URL
-    await downloadFile(text, localPath);
-
-    // Upload to Mega
+    await downloadFile(url, localPath);
     const megaLink = await uploadToMega(localPath, fileName);
 
-    // Clean up local file
     fs.unlinkSync(localPath);
-    console.log('Local file deleted after upload.');
-
-    // Send Mega link to user
-    ctx.reply(`File from link uploaded to Mega: ${megaLink}`);
+    ctx.reply(`Link uploaded to Mega: ${megaLink}`);
   } catch (error) {
-    console.error('Error handling link:', error);
-    ctx.reply('There was an error uploading your file from the link to Mega. Please try again later.');
+    ctx.reply(error.message.includes('timed out')
+      ? 'The download took too long. Try a faster link.'
+      : 'Error uploading your file. Try again later.');
   }
 });
 
-// Start polling instead of using webhook
+// Start polling
 bot.launch()
   .then(() => console.log('Bot is running with polling...'))
   .catch((error) => console.error('Error launching bot:', error));
