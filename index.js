@@ -32,7 +32,7 @@ storage.on('error', (error) => {
   console.error('Error connecting to Mega:', error);
 });
 
-// Helper function to download file from Telegram
+// Helper function to download file from URL
 async function downloadFile(fileLink, destPath) {
   try {
     const response = await fetch(fileLink);
@@ -59,7 +59,7 @@ async function uploadToMega(localFilePath, fileName) {
 
     file.on('complete', () => {
       console.log(`File uploaded to Mega: ${fileName}`);
-      resolve(file.link()); // Get the file link
+      resolve(file.link());
     });
     file.on('error', (error) => {
       console.error('Error uploading to Mega:', error);
@@ -69,12 +69,17 @@ async function uploadToMega(localFilePath, fileName) {
 }
 
 // Bot start command
-bot.start((ctx) => ctx.reply('Welcome! Send me a file to upload to Mega.'));
+bot.start((ctx) => ctx.reply('Welcome! Send me a file under 20MB to upload to Mega, or send a direct download link for larger files (up to 2GB).'));
 
-// Handle file uploads from users
+// Handle files and check size
 bot.on('document', async (ctx) => {
   const fileId = ctx.message.document.file_id;
   const fileName = ctx.message.document.file_name;
+  const fileSize = ctx.message.document.file_size;
+
+  if (fileSize > 20 * 1024 * 1024) { // 20MB limit for Telegram API
+    return ctx.reply('This file is over 20MB. Please send a direct download link (from Google Drive, Dropbox, etc.) instead.');
+  }
 
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
@@ -95,6 +100,39 @@ bot.on('document', async (ctx) => {
   } catch (error) {
     console.error('Error handling file:', error);
     ctx.reply('There was an error uploading your file to Mega. Please try again later.');
+  }
+});
+
+// Handle links for files larger than 20MB
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text;
+
+  // Validate URL format
+  const urlRegex = /^(ftp|http|https):\/\/[^ "]+$/;
+  if (!urlRegex.test(text)) {
+    return ctx.reply('Please send a valid direct download link (URL).');
+  }
+
+  // File name extraction and local path setup
+  const fileName = `file_${Date.now()}.bin`; // Use timestamp as filename
+  const localPath = path.join(__dirname, fileName);
+
+  try {
+    // Download the file from the provided URL
+    await downloadFile(text, localPath);
+
+    // Upload to Mega
+    const megaLink = await uploadToMega(localPath, fileName);
+
+    // Clean up local file
+    fs.unlinkSync(localPath);
+    console.log('Local file deleted after upload.');
+
+    // Send Mega link to user
+    ctx.reply(`File from link uploaded to Mega: ${megaLink}`);
+  } catch (error) {
+    console.error('Error handling link:', error);
+    ctx.reply('There was an error uploading your file from the link to Mega. Please try again later.');
   }
 });
 
