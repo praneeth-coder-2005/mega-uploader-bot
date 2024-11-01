@@ -9,7 +9,7 @@ const pTimeout = require('p-timeout');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes for larger files
+const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -29,7 +29,7 @@ storage.on('error', (error) => {
 
 // Helper to update progress bar in a single message
 async function updateProgress(ctx, messageId, label, progress) {
-  const progressBar = '█'.repeat(progress / 10) + '░'.repeat(10 - progress / 10);
+  const progressBar = '█'.repeat(progress / 20) + '░'.repeat(5 - progress / 20);
   const text = `${label} Progress: [${progressBar}] ${progress}%`;
   try {
     await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
@@ -38,23 +38,27 @@ async function updateProgress(ctx, messageId, label, progress) {
   }
 }
 
-// Function to download file with retry logic
-async function downloadFileWithRetries(fileLink, destPath, ctx, retries = 3) {
+// Function to retry API calls if rate limited
+async function safeApiCall(fn, args, retryDelay = 5000, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      await downloadFile(fileLink, destPath, ctx);
-      console.log('Download successful');
-      return; // Exit if successful
+      return await fn(...args);
     } catch (error) {
-      console.error(`Download attempt ${attempt} failed. Retrying...`);
-      if (attempt === retries) throw error; // Fail after max attempts
+      if (error.response?.error_code === 429) {
+        const waitTime = error.response.parameters?.retry_after || retryDelay / 1000;
+        console.warn(`Rate limited. Retrying in ${waitTime}s...`);
+        await new Promise((resolve) => setTimeout(resolve, waitTime * 1000));
+      } else {
+        throw error;
+      }
     }
   }
+  throw new Error('Max retries reached');
 }
 
 // Function to download a file with progress updates
-async function downloadFile(fileLink, destPath, ctx) {
-  const progressMessage = await ctx.reply('Download Progress: [░░░░░░░░░░] 0%');
+async function downloadFileWithProgress(fileLink, destPath, ctx) {
+  const progressMessage = await ctx.reply('Download Progress: [░░░░░] 0%');
   const messageId = progressMessage.message_id;
 
   const response = await pTimeout(fetch(fileLink), DOWNLOAD_TIMEOUT, 'Download timed out.');
@@ -67,8 +71,8 @@ async function downloadFile(fileLink, destPath, ctx) {
   response.body.on('data', async (chunk) => {
     downloadedBytes += chunk.length;
     const progress = Math.round((downloadedBytes / totalBytes) * 100);
-    if (progress % 10 === 0) {
-      await updateProgress(ctx, messageId, 'Download', progress);
+    if (progress % 20 === 0) { // Update every 20%
+      await safeApiCall(updateProgress, [ctx, messageId, 'Download', progress]);
     }
   });
 
@@ -79,22 +83,9 @@ async function downloadFile(fileLink, destPath, ctx) {
   });
 }
 
-// Function to upload file with retry logic
-async function uploadToMegaWithRetries(localFilePath, fileName, ctx, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const megaLink = await uploadToMega(localFilePath, fileName, ctx);
-      return megaLink;
-    } catch (error) {
-      console.error(`Upload attempt ${attempt} failed. Retrying...`);
-      if (attempt === retries) throw error;
-    }
-  }
-}
-
-// Function to upload file to Mega with progress updates
-async function uploadToMega(localFilePath, fileName, ctx) {
-  const progressMessage = await ctx.reply('Upload Progress: [░░░░░░░░░░] 0%');
+// Function to upload file with progress updates
+async function uploadFileWithProgress(localFilePath, fileName, ctx) {
+  const progressMessage = await ctx.reply('Upload Progress: [░░░░░] 0%');
   const messageId = progressMessage.message_id;
 
   return new Promise((resolve, reject) => {
@@ -106,8 +97,8 @@ async function uploadToMega(localFilePath, fileName, ctx) {
     readStream.on('data', async (chunk) => {
       uploadedBytes += chunk.length;
       const progress = Math.round((uploadedBytes / totalBytes) * 100);
-      if (progress % 10 === 0) {
-        await updateProgress(ctx, messageId, 'Upload', progress);
+      if (progress % 20 === 0) {
+        await safeApiCall(updateProgress, [ctx, messageId, 'Upload', progress]);
       }
     });
 
@@ -115,12 +106,12 @@ async function uploadToMega(localFilePath, fileName, ctx) {
 
     file.on('complete', () => {
       console.log(`File uploaded to Mega: ${fileName}`);
-      ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, 'Upload complete! Link will be shared shortly.');
+      safeApiCall(ctx.telegram.editMessageText, [ctx.chat.id, messageId, undefined, 'Upload complete! Link will be shared shortly.']);
       resolve(file.link());
     });
     file.on('error', (error) => {
       console.error('Error uploading to Mega:', error);
-      ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, 'Upload failed. Please try again.');
+      safeApiCall(ctx.telegram.editMessageText, [ctx.chat.id, messageId, undefined, 'Upload failed. Please try again.']);
       reject(error);
     });
   });
@@ -143,8 +134,8 @@ bot.on('document', async (ctx) => {
     const fileLink = await ctx.telegram.getFileLink(fileId);
     const localPath = path.join(__dirname, fileName);
 
-    await downloadFileWithRetries(fileLink, localPath, ctx);
-    const megaLink = await uploadToMegaWithRetries(localPath, fileName, ctx);
+    await downloadFileWithProgress(fileLink, localPath, ctx);
+    const megaLink = await uploadFileWithProgress(localPath, fileName, ctx);
 
     fs.unlinkSync(localPath);
     ctx.reply(`File uploaded to Mega: ${megaLink}`);
@@ -166,8 +157,8 @@ bot.on('text', async (ctx) => {
   const localPath = path.join(__dirname, fileName);
 
   try {
-    await downloadFileWithRetries(url, localPath, ctx);
-    const megaLink = await uploadToMegaWithRetries(localPath, fileName, ctx);
+    await downloadFileWithProgress(url, localPath, ctx);
+    const megaLink = await uploadFileWithProgress(localPath, fileName, ctx);
 
     fs.unlinkSync(localPath);
     ctx.reply(`Link uploaded to Mega: ${megaLink}`);
