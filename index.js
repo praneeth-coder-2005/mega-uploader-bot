@@ -6,14 +6,16 @@ const mega = require('megajs');
 const fetch = require('node-fetch');
 const express = require('express');
 
-// Initialize Express app
+// Initialize Express app and set port
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Initialize bot with webhook
 const bot = new Telegraf(process.env.BOT_TOKEN);
-app.use(bot.webhookCallback('/bot'));
-bot.telegram.setWebhook(`https://mega-uploader-bot.onrender.com`);  // Replace with your actual Render URL
+const webhookPath = '/bot';
+const webhookURL = `https://mega-uploader-bot.onrender.com${webhookPath}`;
+bot.telegram.setWebhook(webhookURL);
+app.use(bot.webhookCallback(webhookPath));
 
 // Initialize Mega account
 const storage = mega({
@@ -96,7 +98,7 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// Start the Express server and bot with webhook
+// Start Express server
 app.listen(PORT, () => {
   console.log(`Web server is running on port ${PORT}`);
 });
