@@ -6,16 +6,10 @@ const mega = require('megajs');
 const fetch = require('node-fetch');
 const express = require('express');
 
-// Initialize Express app and set port
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize bot with webhook
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const webhookPath = '/bot';
-const webhookURL = `https://mega-uploader-bot.onrender.com${webhookPath}`;
-bot.telegram.setWebhook(webhookURL);
-app.use(bot.webhookCallback(webhookPath));
 
 // Initialize Mega account
 const storage = mega({
@@ -135,6 +129,11 @@ bot.on('text', async (ctx) => {
     ctx.reply('There was an error uploading your file from the link to Mega. Please try again later.');
   }
 });
+
+// Start polling instead of using webhook
+bot.launch()
+  .then(() => console.log('Bot is running with polling...'))
+  .catch((error) => console.error('Error launching bot:', error));
 
 // Start Express server
 app.listen(PORT, () => {
