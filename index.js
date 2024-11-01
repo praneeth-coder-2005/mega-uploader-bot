@@ -149,6 +149,7 @@ bot.on('document', async (ctx) => {
     fs.unlinkSync(localPath);
     ctx.reply(`File uploaded to Mega: ${megaLink}`);
   } catch (error) {
+    console.error('Error during upload process:', error);
     ctx.reply(error.message.includes('canceled') ? 'Operation canceled.' : 'Error uploading your file. Try again later.');
   }
 });
@@ -172,6 +173,7 @@ bot.on('text', async (ctx) => {
     fs.unlinkSync(localPath);
     ctx.reply(`Link uploaded to Mega: ${megaLink}`);
   } catch (error) {
+    console.error('Error during link upload process:', error);
     ctx.reply(error.message.includes('canceled') ? 'Operation canceled.' : 'Error uploading your file. Try again later.');
   }
 });
