@@ -9,7 +9,7 @@ const pTimeout = require('p-timeout');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DOWNLOAD_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes for larger files
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -27,99 +27,128 @@ storage.on('error', (error) => {
   console.error('Error connecting to Mega:', error);
 });
 
-// Helper function to download file with a longer timeout
-async function downloadFile(fileLink, destPath) {
+// Helper function to create a progress bar
+async function updateProgress(ctx, messageId, label, progress) {
+  const progressBar = '█'.repeat(progress / 10) + '░'.repeat(10 - progress / 10);
+  const text = `${label} Progress: [${progressBar}] ${progress}%`;
+  await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
+}
+
+// Function to download file with progress updates
+async function downloadFile(fileLink, destPath, ctx) {
+  const progressMessage = await ctx.reply('Download Progress: [░░░░░░░░░░] 0%');
+  const messageId = progressMessage.message_id;
+
   try {
     const response = await pTimeout(fetch(fileLink), DOWNLOAD_TIMEOUT, 'Download timed out.');
     if (!response.ok) throw new Error(`Failed to fetch file: ${response.statusText}`);
-    
+
+    const totalBytes = Number(response.headers.get('content-length'));
+    let downloadedBytes = 0;
+
     const fileStream = fs.createWriteStream(destPath);
+    response.body.on('data', async (chunk) => {
+      downloadedBytes += chunk.length;
+      const progress = Math.round((downloadedBytes / totalBytes) * 100);
+      if (progress % 10 === 0) {
+        await updateProgress(ctx, messageId, 'Download', progress);
+      }
+    });
+
     response.body.pipe(fileStream);
     await new Promise((resolve, reject) => {
       fileStream.on('finish', resolve);
       fileStream.on('error', reject);
     });
+
     console.log('File downloaded successfully:', destPath);
   } catch (error) {
     console.error('Error downloading file:', error);
+    await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, 'Download failed. Please try again.');
     throw error;
   }
 }
 
-// Function to upload file to Mega
-async function uploadToMega(localFilePath, fileName) {
+// Function to upload file to Mega with progress updates
+async function uploadToMega(localFilePath, fileName, ctx) {
+  const progressMessage = await ctx.reply('Upload Progress: [░░░░░░░░░░] 0%');
+  const messageId = progressMessage.message_id;
+
   return new Promise((resolve, reject) => {
     const file = storage.upload({ name: fileName });
     const readStream = fs.createReadStream(localFilePath);
+    const totalBytes = fs.statSync(localFilePath).size;
+    let uploadedBytes = 0;
+
+    readStream.on('data', async (chunk) => {
+      uploadedBytes += chunk.length;
+      const progress = Math.round((uploadedBytes / totalBytes) * 100);
+      if (progress % 10 === 0) {
+        await updateProgress(ctx, messageId, 'Upload', progress);
+      }
+    });
+
     readStream.pipe(file);
 
     file.on('complete', () => {
       console.log(`File uploaded to Mega: ${fileName}`);
+      ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, 'Upload complete! Link will be shared shortly.');
       resolve(file.link());
     });
     file.on('error', (error) => {
       console.error('Error uploading to Mega:', error);
+      ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, 'Upload failed. Please try again.');
       reject(error);
     });
   });
 }
 
 // Bot start command
-bot.start((ctx) => ctx.reply('Welcome! Send me a file under 20MB to upload to Mega, or send a direct download link for larger files (up to 2GB).'));
+bot.start((ctx) => ctx.reply('Welcome! Send a file under 20MB or a direct download link for larger files.'));
 
 // Handle document uploads
 bot.on('document', async (ctx) => {
-  console.log("Received a document...");
   const fileId = ctx.message.document.file_id;
   const fileName = ctx.message.document.file_name;
   const fileSize = ctx.message.document.file_size;
 
   if (fileSize > 20 * 1024 * 1024) {
-    ctx.reply('File is over 20MB. Please send a direct download link instead.');
-    return;
+    return ctx.reply('File is over 20MB. Please send a direct download link instead.');
   }
 
   try {
-    console.log("Attempting to download file from Telegram...");
     const fileLink = await ctx.telegram.getFileLink(fileId);
     const localPath = path.join(__dirname, fileName);
 
-    await downloadFile(fileLink, localPath);
-    const megaLink = await uploadToMega(localPath, fileName);
+    await downloadFile(fileLink, localPath, ctx);
+    const megaLink = await uploadToMega(localPath, fileName, ctx);
 
     fs.unlinkSync(localPath);
-    console.log("File uploaded to Mega successfully.");
     ctx.reply(`File uploaded to Mega: ${megaLink}`);
   } catch (error) {
-    console.error('Error handling file:', error);
     ctx.reply('Error uploading your file. Try again later.');
   }
 });
 
 // Handle text links for large files
 bot.on('text', async (ctx) => {
-  console.log("Received a text message...");
   const url = ctx.message.text;
 
   const urlPattern = /^(ftp|http|https):\/\/[^ "]+$/;
   if (!urlPattern.test(url)) {
-    ctx.reply('Please send a valid download link.');
-    return;
+    return ctx.reply('Please send a valid download link.');
   }
 
   const fileName = `file_${Date.now()}.bin`;
   const localPath = path.join(__dirname, fileName);
 
   try {
-    console.log("Attempting to download file from URL...");
-    await downloadFile(url, localPath);
-    const megaLink = await uploadToMega(localPath, fileName);
+    await downloadFile(url, localPath, ctx);
+    const megaLink = await uploadToMega(localPath, fileName, ctx);
 
     fs.unlinkSync(localPath);
-    console.log("Link content uploaded to Mega successfully.");
     ctx.reply(`Link uploaded to Mega: ${megaLink}`);
   } catch (error) {
-    console.error('Error handling link:', error);
     ctx.reply(error.message.includes('timed out')
       ? 'The download took too long. Try a faster link.'
       : 'Error uploading your file. Try again later.');
