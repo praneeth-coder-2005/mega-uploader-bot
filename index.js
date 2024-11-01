@@ -9,7 +9,7 @@ const pTimeout = require('p-timeout');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes for larger files
+const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes for large files
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -27,11 +27,15 @@ storage.on('error', (error) => {
   console.error('Error connecting to Mega:', error);
 });
 
-// Helper function to create a progress bar
+// Helper function to update the progress bar in a single message
 async function updateProgress(ctx, messageId, label, progress) {
   const progressBar = '█'.repeat(progress / 10) + '░'.repeat(10 - progress / 10);
   const text = `${label} Progress: [${progressBar}] ${progress}%`;
-  await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
+  try {
+    await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
+  } catch (error) {
+    console.error('Error updating progress:', error);
+  }
 }
 
 // Function to download file with progress updates
