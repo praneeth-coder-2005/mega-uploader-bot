@@ -9,7 +9,10 @@ const pTimeout = require('p-timeout');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes
+const DOWNLOAD_TIMEOUT = 20 * 60 * 1000; // 20 minutes
+const UPLOAD_TIMEOUT = 30 * 60 * 1000; // 30 minutes for upload
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 10000; // 10 seconds
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 let activeDownload = null;
@@ -41,27 +44,39 @@ async function updateProgress(ctx, messageId, label, progress) {
   }
 }
 
-// Cancel button
+// Cancel command
 bot.command('cancel', async (ctx) => {
   if (!activeDownload && !activeUpload) {
     return ctx.reply('No active download or upload to cancel.');
   }
-  
   cancelRequested = true;
   ctx.reply('Canceling the current operation...');
 });
+
+// Retry helper function
+async function retryOperation(operation, retries = MAX_RETRIES) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.error(`Attempt ${attempt} failed. Retrying in ${RETRY_DELAY / 1000} seconds...`);
+      if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+      else throw error;
+    }
+  }
+}
 
 // Function to download a file with progress updates
 async function downloadFileWithProgress(fileLink, destPath, ctx) {
   const progressMessage = await ctx.reply('Download Progress: [░░░░░] 0%');
   const messageId = progressMessage.message_id;
 
-  const response = await pTimeout(fetch(fileLink), DOWNLOAD_TIMEOUT, 'Download timed out.');
+  const response = await retryOperation(() => pTimeout(fetch(fileLink), DOWNLOAD_TIMEOUT));
   if (!response.ok) throw new Error(`Failed to fetch file: ${response.statusText}`);
 
   const totalBytes = Number(response.headers.get('content-length'));
   let downloadedBytes = 0;
-  
+
   const fileStream = fs.createWriteStream(destPath);
   activeDownload = response.body;
 
@@ -92,7 +107,7 @@ async function uploadFileWithProgress(localFilePath, fileName, ctx) {
   const progressMessage = await ctx.reply('Upload Progress: [░░░░░] 0%');
   const messageId = progressMessage.message_id;
 
-  return new Promise((resolve, reject) => {
+  return await retryOperation(async () => {
     const file = storage.upload({ name: fileName });
     const readStream = fs.createReadStream(localFilePath);
     const totalBytes = fs.statSync(localFilePath).size;
@@ -109,19 +124,21 @@ async function uploadFileWithProgress(localFilePath, fileName, ctx) {
         readStream.destroy();
         file.emit('error', new Error('Upload canceled by user.'));
         cancelRequested = false;
-        reject(new Error('Upload canceled by user.'));
+        throw new Error('Upload canceled by user.');
       }
     });
 
     readStream.pipe(file);
 
-    file.on('complete', () => {
-      activeUpload = null;
-      resolve(file.link());
-    });
-    file.on('error', (error) => {
-      activeUpload = null;
-      reject(error);
+    return new Promise((resolve, reject) => {
+      file.on('complete', () => {
+        activeUpload = null;
+        resolve(file.link());
+      });
+      file.on('error', (error) => {
+        activeUpload = null;
+        reject(error);
+      });
     });
   });
 }
