@@ -12,6 +12,9 @@ const PORT = process.env.PORT || 3000;
 const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+let activeDownload = null;
+let activeUpload = null;
+let cancelRequested = false;
 
 // Initialize Mega account
 const storage = mega({
@@ -38,23 +41,15 @@ async function updateProgress(ctx, messageId, label, progress) {
   }
 }
 
-// Function to retry API calls if rate limited
-async function safeApiCall(fn, args, retryDelay = 5000, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn(...args);
-    } catch (error) {
-      if (error.response?.error_code === 429) {
-        const waitTime = error.response.parameters?.retry_after || retryDelay / 1000;
-        console.warn(`Rate limited. Retrying in ${waitTime}s...`);
-        await new Promise((resolve) => setTimeout(resolve, waitTime * 1000));
-      } else {
-        throw error;
-      }
-    }
+// Cancel button
+bot.command('cancel', async (ctx) => {
+  if (!activeDownload && !activeUpload) {
+    return ctx.reply('No active download or upload to cancel.');
   }
-  throw new Error('Max retries reached');
-}
+  
+  cancelRequested = true;
+  ctx.reply('Canceling the current operation...');
+});
 
 // Function to download a file with progress updates
 async function downloadFileWithProgress(fileLink, destPath, ctx) {
@@ -66,13 +61,21 @@ async function downloadFileWithProgress(fileLink, destPath, ctx) {
 
   const totalBytes = Number(response.headers.get('content-length'));
   let downloadedBytes = 0;
-
+  
   const fileStream = fs.createWriteStream(destPath);
-  response.body.on('data', async (chunk) => {
+  activeDownload = response.body;
+
+  activeDownload.on('data', async (chunk) => {
     downloadedBytes += chunk.length;
     const progress = Math.round((downloadedBytes / totalBytes) * 100);
-    if (progress % 20 === 0) { // Update every 20%
-      await safeApiCall(updateProgress, [ctx, messageId, 'Download', progress]);
+    if (progress % 20 === 0) {
+      await updateProgress(ctx, messageId, 'Download', progress);
+    }
+    if (cancelRequested) {
+      response.body.destroy();
+      fileStream.close();
+      cancelRequested = false;
+      throw new Error('Download canceled by user.');
     }
   });
 
@@ -81,6 +84,7 @@ async function downloadFileWithProgress(fileLink, destPath, ctx) {
     fileStream.on('finish', resolve);
     fileStream.on('error', reject);
   });
+  activeDownload = null;
 }
 
 // Function to upload file with progress updates
@@ -93,32 +97,37 @@ async function uploadFileWithProgress(localFilePath, fileName, ctx) {
     const readStream = fs.createReadStream(localFilePath);
     const totalBytes = fs.statSync(localFilePath).size;
     let uploadedBytes = 0;
+    activeUpload = readStream;
 
     readStream.on('data', async (chunk) => {
       uploadedBytes += chunk.length;
       const progress = Math.round((uploadedBytes / totalBytes) * 100);
       if (progress % 20 === 0) {
-        await safeApiCall(updateProgress, [ctx, messageId, 'Upload', progress]);
+        await updateProgress(ctx, messageId, 'Upload', progress);
+      }
+      if (cancelRequested) {
+        readStream.destroy();
+        file.emit('error', new Error('Upload canceled by user.'));
+        cancelRequested = false;
+        reject(new Error('Upload canceled by user.'));
       }
     });
 
     readStream.pipe(file);
 
     file.on('complete', () => {
-      console.log(`File uploaded to Mega: ${fileName}`);
-      safeApiCall(ctx.telegram.editMessageText, [ctx.chat.id, messageId, undefined, 'Upload complete! Link will be shared shortly.']);
+      activeUpload = null;
       resolve(file.link());
     });
     file.on('error', (error) => {
-      console.error('Error uploading to Mega:', error);
-      safeApiCall(ctx.telegram.editMessageText, [ctx.chat.id, messageId, undefined, 'Upload failed. Please try again.']);
+      activeUpload = null;
       reject(error);
     });
   });
 }
 
 // Bot start command
-bot.start((ctx) => ctx.reply('Welcome! Send a file under 20MB or a direct download link for larger files.'));
+bot.start((ctx) => ctx.reply('Welcome! Send a file under 20MB or a direct download link for larger files. Use /cancel to cancel an ongoing download or upload.'));
 
 // Handle document uploads
 bot.on('document', async (ctx) => {
@@ -140,7 +149,7 @@ bot.on('document', async (ctx) => {
     fs.unlinkSync(localPath);
     ctx.reply(`File uploaded to Mega: ${megaLink}`);
   } catch (error) {
-    ctx.reply('Error uploading your file. Try again later.');
+    ctx.reply(error.message.includes('canceled') ? 'Operation canceled.' : 'Error uploading your file. Try again later.');
   }
 });
 
@@ -163,9 +172,7 @@ bot.on('text', async (ctx) => {
     fs.unlinkSync(localPath);
     ctx.reply(`Link uploaded to Mega: ${megaLink}`);
   } catch (error) {
-    ctx.reply(error.message.includes('timed out')
-      ? 'The download took too long. Try a faster link.'
-      : 'Error uploading your file. Try again later.');
+    ctx.reply(error.message.includes('canceled') ? 'Operation canceled.' : 'Error uploading your file. Try again later.');
   }
 });
 
