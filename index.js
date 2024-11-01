@@ -3,13 +3,17 @@ const { Telegraf } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
 const mega = require('megajs');
-const fetch = require('node-fetch'); // Ensure this is installed if needed: npm install node-fetch
+const fetch = require('node-fetch');
 const express = require('express');
 
-// Initialize bot
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize bot with webhook
+const bot = new Telegraf(process.env.BOT_TOKEN);
+app.use(bot.webhookCallback('/bot'));
+bot.telegram.setWebhook(`https://mega-uploader-bot.onrender.com`);  // Replace with your actual Render URL
 
 // Initialize Mega account
 const storage = mega({
@@ -24,12 +28,6 @@ storage.on('ready', () => {
 });
 storage.on('error', (error) => {
   console.error('Error connecting to Mega:', error);
-});
-
-// Express to serve basic routes
-app.use(express.json());
-app.listen(PORT, () => {
-  console.log(`Web server is running on port ${PORT}`);
 });
 
 // Helper function to download file from Telegram
@@ -98,11 +96,7 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// Launch bot
-bot.launch()
-  .then(() => console.log('Bot is running...'))
-  .catch((error) => console.error('Error launching bot:', error));
-
-// Graceful shutdown
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Start the Express server and bot with webhook
+app.listen(PORT, () => {
+  console.log(`Web server is running on port ${PORT}`);
+});
