@@ -65,19 +65,22 @@ async function uploadToMega(localFilePath, fileName) {
 }
 
 // Bot start command
-bot.start((ctx) => ctx.reply('Welcome! Send a file under 20MB or a direct download link for larger files.'));
+bot.start((ctx) => ctx.reply('Welcome! Send me a file under 20MB to upload to Mega, or send a direct download link for larger files (up to 2GB).'));
 
 // Handle document uploads
 bot.on('document', async (ctx) => {
+  console.log("Received a document...");
   const fileId = ctx.message.document.file_id;
   const fileName = ctx.message.document.file_name;
   const fileSize = ctx.message.document.file_size;
 
   if (fileSize > 20 * 1024 * 1024) {
-    return ctx.reply('File is over 20MB. Please send a direct download link instead.');
+    ctx.reply('File is over 20MB. Please send a direct download link instead.');
+    return;
   }
 
   try {
+    console.log("Attempting to download file from Telegram...");
     const fileLink = await ctx.telegram.getFileLink(fileId);
     const localPath = path.join(__dirname, fileName);
 
@@ -85,31 +88,38 @@ bot.on('document', async (ctx) => {
     const megaLink = await uploadToMega(localPath, fileName);
 
     fs.unlinkSync(localPath);
+    console.log("File uploaded to Mega successfully.");
     ctx.reply(`File uploaded to Mega: ${megaLink}`);
   } catch (error) {
+    console.error('Error handling file:', error);
     ctx.reply('Error uploading your file. Try again later.');
   }
 });
 
 // Handle text links for large files
 bot.on('text', async (ctx) => {
+  console.log("Received a text message...");
   const url = ctx.message.text;
 
   const urlPattern = /^(ftp|http|https):\/\/[^ "]+$/;
   if (!urlPattern.test(url)) {
-    return ctx.reply('Please send a valid download link.');
+    ctx.reply('Please send a valid download link.');
+    return;
   }
 
   const fileName = `file_${Date.now()}.bin`;
   const localPath = path.join(__dirname, fileName);
 
   try {
+    console.log("Attempting to download file from URL...");
     await downloadFile(url, localPath);
     const megaLink = await uploadToMega(localPath, fileName);
 
     fs.unlinkSync(localPath);
+    console.log("Link content uploaded to Mega successfully.");
     ctx.reply(`Link uploaded to Mega: ${megaLink}`);
   } catch (error) {
+    console.error('Error handling link:', error);
     ctx.reply(error.message.includes('timed out')
       ? 'The download took too long. Try a faster link.'
       : 'Error uploading your file. Try again later.');
