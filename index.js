@@ -1,206 +1,133 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const fs = require('fs');
-const path = require('path');
-const mega = require('megajs');
 const fetch = require('node-fetch');
+const mega = require('megajs');
 const express = require('express');
-const pTimeout = require('p-timeout');
 
+const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
-const PORT = process.env.PORT || 3000;
-const DOWNLOAD_TIMEOUT = 20 * 60 * 1000; // 20 minutes
-const UPLOAD_TIMEOUT = 30 * 60 * 1000; // 30 minutes for upload
+const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes
+const UPLOAD_TIMEOUT = 20 * 60 * 1000; // 20 minutes
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 10000; // 10 seconds
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Initialize MEGA storage
+const storage = mega({
+  email: process.env.MEGA_EMAIL,
+  password: process.env.MEGA_PASSWORD,
+  autoload: true,
+});
+
+storage.on('ready', () => console.log('Connected to MEGA account'));
+storage.on('error', (error) => console.error('Error connecting to MEGA:', error));
+
+app.listen(process.env.PORT || 3000, () => console.log(`Web server running`));
+
 let activeDownload = null;
 let activeUpload = null;
 let cancelRequested = false;
 
-// Initialize Mega account
-const storage = mega({
-  email: process.env.MEGA_EMAIL,
-  password: process.env.MEGA_PASSWORD,
-  autoload: true
-});
-
-storage.on('ready', () => {
-  console.log('Connected to Mega account successfully');
-});
-storage.on('error', (error) => {
-  console.error('Error connecting to Mega:', error);
-});
-
-// Helper to update progress bar in a single message
+// Helper to update progress
 async function updateProgress(ctx, messageId, label, progress) {
-  const progressBar = '█'.repeat(progress / 20) + '░'.repeat(5 - progress / 20);
+  const progressBar = '█'.repeat(progress / 10) + '░'.repeat(10 - progress / 10);
   const text = `${label} Progress: [${progressBar}] ${progress}%`;
   try {
     await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
   } catch (error) {
-    console.error('Error updating progress:', error);
+    if (error.response && error.response.error_code === 429) {
+      console.warn('Rate limit hit, skipping update.');
+    } else {
+      console.error('Error updating progress:', error);
+    }
   }
 }
 
-// Cancel command
+// Command to cancel ongoing download or upload
 bot.command('cancel', async (ctx) => {
   if (!activeDownload && !activeUpload) {
-    return ctx.reply('No active download or upload to cancel.');
+    await ctx.reply('No active download or upload to cancel.');
+    return;
   }
   cancelRequested = true;
-  ctx.reply('Canceling the current operation...');
+  await ctx.reply('Canceling the current operation...');
 });
 
-// Retry helper function
-async function retryOperation(operation, retries = MAX_RETRIES) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+// Download function
+async function downloadFile(ctx, url) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    if (cancelRequested) return;
     try {
-      return await operation();
+      const response = await fetch(url, { timeout: DOWNLOAD_TIMEOUT });
+      if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`);
+      const dest = fs.createWriteStream('tempfile');
+
+      return new Promise((resolve, reject) => {
+        response.body.pipe(dest);
+        response.body.on('data', (chunk) => {
+          const progress = Math.round((dest.bytesWritten / response.headers.get('content-length')) * 100);
+          if (progress % 10 === 0) updateProgress(ctx, ctx.message.message_id, 'Downloading', progress);
+        });
+        response.body.on('error', reject);
+        response.body.on('end', () => resolve('tempfile'));
+      });
     } catch (error) {
-      console.error(`Attempt ${attempt} failed. Retrying in ${RETRY_DELAY / 1000} seconds...`);
-      if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+      console.error(`Download attempt ${attempt} failed:`, error);
+      if (attempt < MAX_RETRIES) await new Promise((res) => setTimeout(res, RETRY_DELAY));
       else throw error;
     }
   }
 }
 
-// Function to download a file with progress updates
-async function downloadFileWithProgress(fileLink, destPath, ctx) {
-  const progressMessage = await ctx.reply('Download Progress: [░░░░░] 0%');
-  const messageId = progressMessage.message_id;
-
-  const response = await retryOperation(() => pTimeout(fetch(fileLink), DOWNLOAD_TIMEOUT));
-  if (!response.ok) throw new Error(`Failed to fetch file: ${response.statusText}`);
-
-  const totalBytes = Number(response.headers.get('content-length'));
-  let downloadedBytes = 0;
-
-  const fileStream = fs.createWriteStream(destPath);
-  activeDownload = response.body;
-
-  activeDownload.on('data', async (chunk) => {
-    downloadedBytes += chunk.length;
-    const progress = Math.round((downloadedBytes / totalBytes) * 100);
-    if (progress % 20 === 0) {
-      await updateProgress(ctx, messageId, 'Download', progress);
-    }
-    if (cancelRequested) {
-      response.body.destroy();
-      fileStream.close();
-      cancelRequested = false;
-      throw new Error('Download canceled by user.');
-    }
-  });
-
-  response.body.pipe(fileStream);
-  await new Promise((resolve, reject) => {
-    fileStream.on('finish', resolve);
-    fileStream.on('error', reject);
-  });
-  activeDownload = null;
-}
-
-// Function to upload file with progress updates
-async function uploadFileWithProgress(localFilePath, fileName, ctx) {
-  const progressMessage = await ctx.reply('Upload Progress: [░░░░░] 0%');
-  const messageId = progressMessage.message_id;
-
-  return await retryOperation(async () => {
-    const file = storage.upload({ name: fileName });
-    const readStream = fs.createReadStream(localFilePath);
-    const totalBytes = fs.statSync(localFilePath).size;
+// Upload function to MEGA
+async function uploadFile(ctx, filePath) {
+  if (cancelRequested) return;
+  return new Promise((resolve, reject) => {
+    const uploadStream = storage.upload(filePath, fs.statSync(filePath).size);
     let uploadedBytes = 0;
-    activeUpload = readStream;
 
-    readStream.on('data', async (chunk) => {
-      uploadedBytes += chunk.length;
-      const progress = Math.round((uploadedBytes / totalBytes) * 100);
-      if (progress % 20 === 0) {
-        await updateProgress(ctx, messageId, 'Upload', progress);
-      }
-      if (cancelRequested) {
-        readStream.destroy();
-        file.emit('error', new Error('Upload canceled by user.'));
-        cancelRequested = false;
-        throw new Error('Upload canceled by user.');
-      }
+    uploadStream.on('progress', (bytes) => {
+      uploadedBytes += bytes;
+      const progress = Math.round((uploadedBytes / fs.statSync(filePath).size) * 100);
+      if (progress % 10 === 0) updateProgress(ctx, ctx.message.message_id, 'Uploading', progress);
     });
 
-    readStream.pipe(file);
-
-    return new Promise((resolve, reject) => {
-      file.on('complete', () => {
-        activeUpload = null;
-        resolve(file.link());
-      });
-      file.on('error', (error) => {
-        activeUpload = null;
-        reject(error);
-      });
+    uploadStream.on('complete', (file) => {
+      resolve(file.link());
     });
+    uploadStream.on('error', reject);
   });
 }
 
-// Bot start command
-bot.start((ctx) => ctx.reply('Welcome! Send a file under 20MB or a direct download link for larger files. Use /cancel to cancel an ongoing download or upload.'));
-
-// Handle document uploads
-bot.on('document', async (ctx) => {
-  const fileId = ctx.message.document.file_id;
-  const fileName = ctx.message.document.file_name;
-  const fileSize = ctx.message.document.file_size;
-
-  if (fileSize > 20 * 1024 * 1024) {
-    return ctx.reply('File is over 20MB. Please send a direct download link instead.');
-  }
-
-  try {
-    const fileLink = await ctx.telegram.getFileLink(fileId);
-    const localPath = path.join(__dirname, fileName);
-
-    await downloadFileWithProgress(fileLink, localPath, ctx);
-    const megaLink = await uploadFileWithProgress(localPath, fileName, ctx);
-
-    fs.unlinkSync(localPath);
-    ctx.reply(`File uploaded to Mega: ${megaLink}`);
-  } catch (error) {
-    console.error('Error during upload process:', error);
-    ctx.reply(error.message.includes('canceled') ? 'Operation canceled.' : 'Error uploading your file. Try again later.');
-  }
-});
-
-// Handle text links for large files
+// Main handler for links
 bot.on('text', async (ctx) => {
   const url = ctx.message.text;
-
-  const urlPattern = /^(ftp|http|https):\/\/[^ "]+$/;
-  if (!urlPattern.test(url)) {
+  if (!url.startsWith('http')) {
     return ctx.reply('Please send a valid download link.');
   }
 
-  const fileName = `file_${Date.now()}.bin`;
-  const localPath = path.join(__dirname, fileName);
-
+  activeDownload = downloadFile(ctx, url);
   try {
-    await downloadFileWithProgress(url, localPath, ctx);
-    const megaLink = await uploadFileWithProgress(localPath, fileName, ctx);
+    const filePath = await activeDownload;
+    if (!filePath) return ctx.reply('Download was canceled.');
 
-    fs.unlinkSync(localPath);
-    ctx.reply(`Link uploaded to Mega: ${megaLink}`);
+    await ctx.reply('File downloaded successfully. Starting upload to MEGA...');
+    activeUpload = uploadFile(ctx, filePath);
+
+    const link = await activeUpload;
+    if (!link) return ctx.reply('Upload was canceled.');
+
+    await ctx.reply(`File uploaded successfully! Here’s your link: ${link}`);
   } catch (error) {
-    console.error('Error during link upload process:', error);
-    ctx.reply(error.message.includes('canceled') ? 'Operation canceled.' : 'Error uploading your file. Try again later.');
+    console.error('Error during download/upload:', error);
+    await ctx.reply('An error occurred. Please try again later.');
+  } finally {
+    activeDownload = null;
+    activeUpload = null;
+    cancelRequested = false;
+    fs.unlinkSync('tempfile'); // Remove temp file after process
   }
 });
 
-// Start polling
-bot.launch()
-  .then(() => console.log('Bot is running with polling...'))
-  .catch((error) => console.error('Error launching bot:', error));
-
-// Start Express server
-app.listen(PORT, () => {
-  console.log(`Web server is running on port ${PORT}`);
-});
+bot.catch((err) => console.error('Bot Error:', err));
+bot.launch();
