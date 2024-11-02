@@ -1,162 +1,99 @@
-require('dotenv').config();
 const { Telegraf } = require('telegraf');
-const fs = require('fs');
 const mega = require('megajs');
-const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+require('dotenv').config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const dataFilePath = 'megaCredentials.json';
+
 let megaStorage;
-let userState = {}; // Tracks if the user is entering email or password
 
-// Save MEGA credentials
-function saveMegaCredentials(email, password) {
-  fs.writeFileSync(dataFilePath, JSON.stringify({ email, password }));
-}
-
-// Load MEGA credentials
-function loadMegaCredentials() {
-  if (fs.existsSync(dataFilePath)) {
-    return JSON.parse(fs.readFileSync(dataFilePath));
-  }
-  return null;
-}
-
-// Initialize MEGA storage
-function initializeMega(ctx) {
-  const credentials = loadMegaCredentials();
-  if (!credentials || !credentials.email || !credentials.password) return ctx.reply('Incomplete MEGA credentials.');
-
-  megaStorage = mega({
-    email: credentials.email,
-    password: credentials.password,
-    autoload: true,
+// Connect to MEGA when the bot starts
+async function connectToMega() {
+  megaStorage = new mega.Storage({
+    email: process.env.MEGA_EMAIL,
+    password: process.env.MEGA_PASSWORD
   });
 
-  megaStorage.on('ready', () => ctx.reply('Connected to MEGA account successfully. You can now upload files.'));
-  megaStorage.on('error', (error) => {
-    console.error('Error connecting to MEGA:', error);
-    ctx.reply('Failed to connect to MEGA. Please check your credentials.');
-    userState[ctx.from.id] = 'email'; // Reset to email prompt in case of error
+  await new Promise((resolve, reject) => {
+    megaStorage.on('ready', resolve).on('error', reject);
+  });
+  console.log("Connected to MEGA successfully.");
+}
+
+// Start command: connect to MEGA and prompt the user to upload files
+bot.start(async (ctx) => {
+  await connectToMega();
+  ctx.reply("You are connected to MEGA. You can now upload files by sending file links or attachments.");
+});
+
+// Function to handle file uploads
+async function uploadToMega(filePath, fileName, ctx) {
+  return new Promise((resolve, reject) => {
+    const file = megaStorage.upload({ name: fileName, size: fs.statSync(filePath).size }, fs.createReadStream(filePath));
+
+    file.on('complete', () => {
+      fs.unlinkSync(filePath); // Delete local file after upload
+      file.link((err, link) => {
+        if (err) reject(err);
+        ctx.reply(`File uploaded successfully: ${link}`);
+        resolve();
+      });
+    });
+
+    file.on('error', (err) => {
+      ctx.reply("Error uploading your file. Try again later.");
+      reject(err);
+    });
   });
 }
 
-// Start command - Initiate email input
-bot.start((ctx) => {
-  ctx.reply('Welcome! Please enter your MEGA email to get started.');
-  userState[ctx.from.id] = 'email';
-});
-
-// Handle incoming messages for email and password setup
-bot.on('text', (ctx) => {
-  const userId = ctx.from.id;
-
-  if (userState[userId] === 'email') {
-    const email = ctx.message.text.trim();
-    if (!email.includes('@')) return ctx.reply('Invalid email format. Please try again.');
-
-    const credentials = loadMegaCredentials() || {};
-    credentials.email = email;
-    saveMegaCredentials(credentials.email, credentials.password);
-    ctx.reply('Email saved. Now, please enter your MEGA password.');
-    userState[userId] = 'password';
-
-  } else if (userState[userId] === 'password') {
-    const password = ctx.message.text.trim();
-
-    const credentials = loadMegaCredentials();
-    credentials.password = password;
-    saveMegaCredentials(credentials.email, credentials.password);
-    ctx.reply('Password saved. Attempting to connect to MEGA...');
-    
-    initializeMega(ctx);
-    userState[userId] = 'connected';
-
-  } else if (userState[userId] === 'connected') {
-    ctx.reply('You are connected to MEGA. You can now upload files by sending file links or attachments.');
-  } else {
-    ctx.reply('Please start the bot with /start to set up your credentials.');
-  }
-});
-
-// Handle file or link messages
+// Handle file and URL uploads
 bot.on('message', async (ctx) => {
-  const userId = ctx.from.id;
+  const message = ctx.message;
 
-  if (userState[userId] !== 'connected') {
-    return ctx.reply('Please complete MEGA setup first by entering email and password.');
-  }
+  // Check if the message contains a document (file attachment)
+  if (message.document) {
+    const fileId = message.document.file_id;
+    const fileLink = await ctx.telegram.getFileLink(fileId);
+    const filePath = path.join(__dirname, message.document.file_name);
 
-  if (ctx.message.document) {
-    const fileId = ctx.message.document.file_id;
-    const fileName = ctx.message.document.file_name;
-    const fileSize = ctx.message.document.file_size;
+    // Download the file
+    const response = await axios.get(fileLink.href, { responseType: 'stream' });
+    const writer = fs.createWriteStream(filePath);
 
-    ctx.reply(`Uploading file: ${fileName} (${fileSize} bytes)...`);
+    response.data.pipe(writer);
+    writer.on('finish', async () => {
+      await uploadToMega(filePath, message.document.file_name, ctx);
+    });
+    writer.on('error', () => {
+      ctx.reply("Error downloading the file. Try again later.");
+    });
 
-    try {
-      const fileLink = await bot.telegram.getFileLink(fileId);
-      const response = await axios({
-        url: fileLink.href,
-        method: 'GET',
-        responseType: 'stream',
-      });
+  // Check if the message contains a URL link
+  } else if (message.entities && message.entities[0].type === 'url') {
+    const url = message.text;
+    const fileName = path.basename(url);
+    const filePath = path.join(__dirname, fileName);
 
-      const uploadStream = megaStorage.upload(fileName);
+    // Download the file
+    const response = await axios.get(url, { responseType: 'stream' });
+    const writer = fs.createWriteStream(filePath);
 
-      response.data.pipe(uploadStream);
-
-      uploadStream.on('complete', () => {
-        ctx.reply(`File uploaded successfully: ${fileName}`);
-      });
-
-      uploadStream.on('error', (error) => {
-        console.error('Error uploading file:', error);
-        ctx.reply('Error uploading your file. Please try again later.');
-      });
-    } catch (error) {
-      console.error('Error downloading file:', error);
-      ctx.reply('There was an error downloading your file. Please try again later.');
-    }
-
-  } else if (ctx.message.text && ctx.message.text.startsWith('http')) {
-    const url = ctx.message.text;
-
-    ctx.reply('Attempting to download and upload the file from the provided link...');
-
-    try {
-      const response = await axios({
-        url,
-        method: 'GET',
-        responseType: 'stream',
-      });
-
-      const fileName = url.split('/').pop().split('?')[0];
-      const uploadStream = megaStorage.upload(fileName);
-
-      response.data.pipe(uploadStream);
-
-      uploadStream.on('complete', () => {
-        ctx.reply(`File from link uploaded successfully: ${fileName}`);
-      });
-
-      uploadStream.on('error', (error) => {
-        console.error('Error uploading file:', error);
-        ctx.reply('Error uploading your file from the link. Please try again later.');
-      });
-    } catch (error) {
-      console.error('Error downloading file from link:', error);
-      ctx.reply('There was an error downloading the file from the link. Please check the link and try again.');
-    }
+    response.data.pipe(writer);
+    writer.on('finish', async () => {
+      await uploadToMega(filePath, fileName, ctx);
+    });
+    writer.on('error', () => {
+      ctx.reply("Error downloading the file. Try again later.");
+    });
   } else {
-    ctx.reply('Please send a file or a valid URL to upload.');
+    ctx.reply("Please send a file or a valid link to upload.");
   }
 });
 
-// Express server setup
-const app = express();
-app.listen(process.env.PORT || 3000, () => console.log(`Web server running`));
-
-// Start bot
-bot.launch();
+// Launch the bot
+bot.launch().then(() => {
+  console.log("Bot is running...");
+});
