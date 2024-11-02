@@ -1,16 +1,16 @@
 {
   "name": "mega-uploader-bot",
   "version": "1.0.0",
-  "description": "A Telegram bot for uploading files to Mega",
+  "description": "A bot that uploads files to MEGA",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.4.2",
-    "megajs": "^1.1.0",
+    "telegraf": "^4.3.0",
+    "megajs": "^1.1.1",
     "dotenv": "^10.0.0",
-    "express": "^4.17.1",
-    "node-fetch": "^2.6.1"
+    "axios": "^0.27.2",  // Ensure axios is listed here
+    "express": "^4.17.1"
   }
 }
