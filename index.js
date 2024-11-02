@@ -1,99 +1,128 @@
+// index.js
+
 const { Telegraf } = require('telegraf');
-const mega = require('megajs');
+const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config();
+const Mega = require('megajs');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const app = express();
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_URL = 'https://mega-uploader-bot.onrender.com';
 
-let megaStorage;
+let megaStorage = null;  // Store MEGA connection
+let isLoggedIn = false;  // Track login state
+let awaitingEmail = false;
+let awaitingPassword = false;
+let email = "";
 
-// Connect to MEGA when the bot starts
-async function connectToMega() {
-  megaStorage = new mega.Storage({
-    email: process.env.MEGA_EMAIL,
-    password: process.env.MEGA_PASSWORD
-  });
+// Set webhook for Telegram bot
+bot.telegram.setWebhook(`${WEBHOOK_URL}/bot`);
+app.use(bot.webhookCallback('/bot'));
 
-  await new Promise((resolve, reject) => {
-    megaStorage.on('ready', resolve).on('error', reject);
-  });
-  console.log("Connected to MEGA successfully.");
-}
-
-// Start command: connect to MEGA and prompt the user to upload files
-bot.start(async (ctx) => {
-  await connectToMega();
-  ctx.reply("You are connected to MEGA. You can now upload files by sending file links or attachments.");
+// Root route to confirm bot is running
+app.get('/', (req, res) => {
+  res.send('Bot is running!');
 });
 
-// Function to handle file uploads
-async function uploadToMega(filePath, fileName, ctx) {
-  return new Promise((resolve, reject) => {
-    const file = megaStorage.upload({ name: fileName, size: fs.statSync(filePath).size }, fs.createReadStream(filePath));
+// Start command to prompt for email
+bot.start((ctx) => {
+  isLoggedIn = false;
+  awaitingEmail = true;
+  awaitingPassword = false;
+  ctx.reply("Welcome to the MEGA uploader bot! Please enter your MEGA account email to begin:");
+});
 
-    file.on('complete', () => {
-      fs.unlinkSync(filePath); // Delete local file after upload
-      file.link((err, link) => {
-        if (err) reject(err);
-        ctx.reply(`File uploaded successfully: ${link}`);
-        resolve();
+// Handle email entry
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text;
+
+  if (awaitingEmail) {
+    email = text;
+    awaitingEmail = false;
+    awaitingPassword = true;
+    ctx.reply("Thank you! Now, please enter your MEGA account password:");
+  } else if (awaitingPassword) {
+    const password = text;
+    ctx.reply("Logging in to MEGA...");
+
+    // Attempt to log in to MEGA
+    megaStorage = new Mega.Storage({
+      email,
+      password,
+    });
+
+    megaStorage.on('ready', () => {
+      isLoggedIn = true;
+      awaitingPassword = false;
+      ctx.reply("You are now logged in to MEGA! Send a file link or attachment to upload.");
+    });
+
+    megaStorage.on('error', (error) => {
+      console.error("Login error:", error);
+      ctx.reply("Login failed. Please use /start to try again.");
+      isLoggedIn = false;
+    });
+  } else if (isLoggedIn && text.startsWith('http')) {
+    // Upload a file from link
+    ctx.reply("Uploading link to MEGA...");
+
+    try {
+      const response = await axios.get(text, { responseType: 'stream' });
+      const filename = text.split('/').pop();
+      const upload = megaStorage.upload(filename);
+
+      response.data.pipe(upload);
+
+      upload.on('complete', () => {
+        ctx.reply(`File uploaded to MEGA as: ${filename}`);
       });
-    });
 
-    file.on('error', (err) => {
-      ctx.reply("Error uploading your file. Try again later.");
-      reject(err);
-    });
-  });
-}
-
-// Handle file and URL uploads
-bot.on('message', async (ctx) => {
-  const message = ctx.message;
-
-  // Check if the message contains a document (file attachment)
-  if (message.document) {
-    const fileId = message.document.file_id;
-    const fileLink = await ctx.telegram.getFileLink(fileId);
-    const filePath = path.join(__dirname, message.document.file_name);
-
-    // Download the file
-    const response = await axios.get(fileLink.href, { responseType: 'stream' });
-    const writer = fs.createWriteStream(filePath);
-
-    response.data.pipe(writer);
-    writer.on('finish', async () => {
-      await uploadToMega(filePath, message.document.file_name, ctx);
-    });
-    writer.on('error', () => {
-      ctx.reply("Error downloading the file. Try again later.");
-    });
-
-  // Check if the message contains a URL link
-  } else if (message.entities && message.entities[0].type === 'url') {
-    const url = message.text;
-    const fileName = path.basename(url);
-    const filePath = path.join(__dirname, fileName);
-
-    // Download the file
-    const response = await axios.get(url, { responseType: 'stream' });
-    const writer = fs.createWriteStream(filePath);
-
-    response.data.pipe(writer);
-    writer.on('finish', async () => {
-      await uploadToMega(filePath, fileName, ctx);
-    });
-    writer.on('error', () => {
-      ctx.reply("Error downloading the file. Try again later.");
-    });
-  } else {
-    ctx.reply("Please send a file or a valid link to upload.");
+      upload.on('error', (error) => {
+        console.error("Upload error:", error);
+        ctx.reply("There was an error uploading your file to MEGA.");
+      });
+    } catch (error) {
+      console.error("Error processing link:", error);
+      ctx.reply("There was an error processing your link.");
+    }
+  } else if (!isLoggedIn) {
+    ctx.reply("Please log in first by using /start.");
   }
 });
 
-// Launch the bot
-bot.launch().then(() => {
-  console.log("Bot is running...");
+// Handle file uploads
+bot.on('document', async (ctx) => {
+  if (!isLoggedIn) {
+    return ctx.reply("Please log in first by using /start.");
+  }
+
+  try {
+    const fileId = ctx.message.document.file_id;
+    const fileLink = await bot.telegram.getFileLink(fileId);
+    ctx.reply("Uploading file to MEGA...");
+
+    const response = await axios.get(fileLink, { responseType: 'stream' });
+    const filename = ctx.message.document.file_name;
+    const upload = megaStorage.upload(filename);
+
+    response.data.pipe(upload);
+
+    upload.on('complete', () => {
+      ctx.reply(`File uploaded to MEGA as: ${filename}`);
+    });
+
+    upload.on('error', (error) => {
+      console.error("Upload error:", error);
+      ctx.reply("There was an error uploading your file to MEGA.");
+    });
+  } catch (error) {
+    console.error("Error handling document:", error);
+    ctx.reply("There was an error processing your file.");
+  }
+});
+
+// Start Express server
+app.listen(PORT, () => {
+  console.log(`Web server is running on port ${PORT}`);
 });
