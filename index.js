@@ -4,7 +4,6 @@ const { Telegraf } = require('telegraf');
 const express = require('express');
 const axios = require('axios');
 const Mega = require('megajs');
-const fs = require('fs');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
@@ -93,6 +92,7 @@ async function handleFileUpload(ctx, fileUrl) {
     ctx.reply("Starting download and upload to MEGA...");
     let downloadedBytes = 0;
     let startTime = Date.now();
+    let progressMessageId = null;
 
     const downloadStream = await axios.get(fileUrl, { responseType: 'stream' });
     const upload = megaStorage.upload({ name: filename, size: fileSize });
@@ -103,10 +103,22 @@ async function handleFileUpload(ctx, fileUrl) {
       const elapsedTime = (Date.now() - startTime) / 1000;
       const speed = (downloadedBytes / elapsedTime / 1024).toFixed(2); // KB/s
 
-      ctx.telegram.sendMessage(
-        ctx.chat.id,
-        `Download & Upload Progress: ${percentage}% (${speed} KB/s)`
-      );
+      const progressMessage = `Download & Upload Progress: ${percentage}% (${speed} KB/s)`;
+
+      if (!progressMessageId) {
+        // Send the initial progress message
+        ctx.reply(progressMessage).then((message) => {
+          progressMessageId = message.message_id;
+        });
+      } else {
+        // Edit the existing progress message
+        ctx.telegram.editMessageText(
+          ctx.chat.id,
+          progressMessageId,
+          null,
+          progressMessage
+        );
+      }
     });
 
     downloadStream.data.pipe(upload);
