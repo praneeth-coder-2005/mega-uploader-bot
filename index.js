@@ -1,133 +1,90 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const fs = require('fs');
-const fetch = require('node-fetch');
 const mega = require('megajs');
 const express = require('express');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const app = express();
-const DOWNLOAD_TIMEOUT = 15 * 60 * 1000; // 15 minutes
-const UPLOAD_TIMEOUT = 20 * 60 * 1000; // 20 minutes
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 10000; // 10 seconds
+const dataFilePath = 'megaCredentials.json';
+let megaStorage;
+let userState = {}; // Tracks if the user is entering email or password
+
+// Save MEGA credentials
+function saveMegaCredentials(email, password) {
+  fs.writeFileSync(dataFilePath, JSON.stringify({ email, password }));
+}
+
+// Load MEGA credentials
+function loadMegaCredentials() {
+  if (fs.existsSync(dataFilePath)) {
+    return JSON.parse(fs.readFileSync(dataFilePath));
+  }
+  return null;
+}
 
 // Initialize MEGA storage
-const storage = mega({
-  email: process.env.MEGA_EMAIL,
-  password: process.env.MEGA_PASSWORD,
-  autoload: true,
-});
+function initializeMega(ctx) {
+  const credentials = loadMegaCredentials();
+  if (!credentials || !credentials.email || !credentials.password) return ctx.reply('Incomplete MEGA credentials.');
 
-storage.on('ready', () => console.log('Connected to MEGA account'));
-storage.on('error', (error) => console.error('Error connecting to MEGA:', error));
+  megaStorage = mega({
+    email: credentials.email,
+    password: credentials.password,
+    autoload: true,
+  });
 
-app.listen(process.env.PORT || 3000, () => console.log(`Web server running`));
-
-let activeDownload = null;
-let activeUpload = null;
-let cancelRequested = false;
-
-// Helper to update progress
-async function updateProgress(ctx, messageId, label, progress) {
-  const progressBar = '█'.repeat(progress / 10) + '░'.repeat(10 - progress / 10);
-  const text = `${label} Progress: [${progressBar}] ${progress}%`;
-  try {
-    await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text);
-  } catch (error) {
-    if (error.response && error.response.error_code === 429) {
-      console.warn('Rate limit hit, skipping update.');
-    } else {
-      console.error('Error updating progress:', error);
-    }
-  }
-}
-
-// Command to cancel ongoing download or upload
-bot.command('cancel', async (ctx) => {
-  if (!activeDownload && !activeUpload) {
-    await ctx.reply('No active download or upload to cancel.');
-    return;
-  }
-  cancelRequested = true;
-  await ctx.reply('Canceling the current operation...');
-});
-
-// Download function
-async function downloadFile(ctx, url) {
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    if (cancelRequested) return;
-    try {
-      const response = await fetch(url, { timeout: DOWNLOAD_TIMEOUT });
-      if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`);
-      const dest = fs.createWriteStream('tempfile');
-
-      return new Promise((resolve, reject) => {
-        response.body.pipe(dest);
-        response.body.on('data', (chunk) => {
-          const progress = Math.round((dest.bytesWritten / response.headers.get('content-length')) * 100);
-          if (progress % 10 === 0) updateProgress(ctx, ctx.message.message_id, 'Downloading', progress);
-        });
-        response.body.on('error', reject);
-        response.body.on('end', () => resolve('tempfile'));
-      });
-    } catch (error) {
-      console.error(`Download attempt ${attempt} failed:`, error);
-      if (attempt < MAX_RETRIES) await new Promise((res) => setTimeout(res, RETRY_DELAY));
-      else throw error;
-    }
-  }
-}
-
-// Upload function to MEGA
-async function uploadFile(ctx, filePath) {
-  if (cancelRequested) return;
-  return new Promise((resolve, reject) => {
-    const uploadStream = storage.upload(filePath, fs.statSync(filePath).size);
-    let uploadedBytes = 0;
-
-    uploadStream.on('progress', (bytes) => {
-      uploadedBytes += bytes;
-      const progress = Math.round((uploadedBytes / fs.statSync(filePath).size) * 100);
-      if (progress % 10 === 0) updateProgress(ctx, ctx.message.message_id, 'Uploading', progress);
-    });
-
-    uploadStream.on('complete', (file) => {
-      resolve(file.link());
-    });
-    uploadStream.on('error', reject);
+  megaStorage.on('ready', () => ctx.reply('Connected to MEGA account successfully. You can now upload files.'));
+  megaStorage.on('error', (error) => {
+    console.error('Error connecting to MEGA:', error);
+    ctx.reply('Failed to connect to MEGA. Please check your credentials.');
+    userState[ctx.from.id] = 'email'; // Reset to email prompt in case of error
   });
 }
 
-// Main handler for links
-bot.on('text', async (ctx) => {
-  const url = ctx.message.text;
-  if (!url.startsWith('http')) {
-    return ctx.reply('Please send a valid download link.');
-  }
+// Start command - Initiate email input
+bot.start((ctx) => {
+  ctx.reply('Welcome! Please enter your MEGA email to get started.');
+  userState[ctx.from.id] = 'email';
+});
 
-  activeDownload = downloadFile(ctx, url);
-  try {
-    const filePath = await activeDownload;
-    if (!filePath) return ctx.reply('Download was canceled.');
+// Handle incoming messages for email and password setup
+bot.on('text', (ctx) => {
+  const userId = ctx.from.id;
 
-    await ctx.reply('File downloaded successfully. Starting upload to MEGA...');
-    activeUpload = uploadFile(ctx, filePath);
+  // Check if the user is in the "email" state
+  if (userState[userId] === 'email') {
+    const email = ctx.message.text.trim();
+    if (!email.includes('@')) return ctx.reply('Invalid email format. Please try again.');
 
-    const link = await activeUpload;
-    if (!link) return ctx.reply('Upload was canceled.');
+    // Save email and prompt for password
+    const credentials = loadMegaCredentials() || {};
+    credentials.email = email;
+    saveMegaCredentials(credentials.email, credentials.password);
+    ctx.reply('Email saved. Now, please enter your MEGA password.');
+    userState[userId] = 'password';
 
-    await ctx.reply(`File uploaded successfully! Here’s your link: ${link}`);
-  } catch (error) {
-    console.error('Error during download/upload:', error);
-    await ctx.reply('An error occurred. Please try again later.');
-  } finally {
-    activeDownload = null;
-    activeUpload = null;
-    cancelRequested = false;
-    fs.unlinkSync('tempfile'); // Remove temp file after process
+  } else if (userState[userId] === 'password') {
+    const password = ctx.message.text.trim();
+
+    // Save password and attempt MEGA connection
+    const credentials = loadMegaCredentials();
+    credentials.password = password;
+    saveMegaCredentials(credentials.email, credentials.password);
+    ctx.reply('Password saved. Attempting to connect to MEGA...');
+    
+    initializeMega(ctx);
+    userState[userId] = 'connected'; // Set state to connected after successful login
+
+  } else if (userState[userId] === 'connected') {
+    ctx.reply('You are connected to MEGA. You can now upload files by sending file links or attachments.');
+  } else {
+    ctx.reply('Please start the bot with /start to set up your credentials.');
   }
 });
 
-bot.catch((err) => console.error('Bot Error:', err));
+// Express server setup
+const app = express();
+app.listen(process.env.PORT || 3000, () => console.log(`Web server running`));
+
+// Start bot
 bot.launch();
