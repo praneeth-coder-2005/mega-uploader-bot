@@ -65,14 +65,25 @@ bot.on('text', async (ctx) => {
     });
   } else if (isLoggedIn && text.startsWith('http')) {
     // Upload a file from link
-    ctx.reply("Uploading link to MEGA...");
+    ctx.reply("Fetching file details...");
 
     try {
-      const response = await axios.get(text, { responseType: 'stream' });
+      const response = await axios.head(text); // Get file metadata without downloading
+      const fileSize = parseInt(response.headers['content-length'], 10);
       const filename = text.split('/').pop();
-      const upload = megaStorage.upload(filename);
 
-      response.data.pipe(upload);
+      if (!fileSize || isNaN(fileSize)) {
+        ctx.reply("Error: Unable to retrieve file size. Please check the link and try again.");
+        return;
+      }
+
+      ctx.reply("Uploading link to MEGA...");
+
+      // Now start streaming the file
+      const downloadResponse = await axios.get(text, { responseType: 'stream' });
+      const upload = megaStorage.upload({ name: filename, size: fileSize });
+
+      downloadResponse.data.pipe(upload);
 
       upload.on('complete', () => {
         ctx.reply(`File uploaded to MEGA as: ${filename}`);
@@ -100,13 +111,24 @@ bot.on('document', async (ctx) => {
   try {
     const fileId = ctx.message.document.file_id;
     const fileLink = await bot.telegram.getFileLink(fileId);
+    ctx.reply("Fetching file details...");
+
+    const response = await axios.head(fileLink); // Get file metadata
+    const fileSize = parseInt(response.headers['content-length'], 10);
+    const filename = ctx.message.document.file_name;
+
+    if (!fileSize || isNaN(fileSize)) {
+      ctx.reply("Error: Unable to retrieve file size. Please try again.");
+      return;
+    }
+
     ctx.reply("Uploading file to MEGA...");
 
-    const response = await axios.get(fileLink, { responseType: 'stream' });
-    const filename = ctx.message.document.file_name;
-    const upload = megaStorage.upload(filename);
+    // Stream file to MEGA
+    const downloadResponse = await axios.get(fileLink, { responseType: 'stream' });
+    const upload = megaStorage.upload({ name: filename, size: fileSize });
 
-    response.data.pipe(upload);
+    downloadResponse.data.pipe(upload);
 
     upload.on('complete', () => {
       ctx.reply(`File uploaded to MEGA as: ${filename}`);
