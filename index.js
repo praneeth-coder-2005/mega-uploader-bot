@@ -4,6 +4,8 @@ const { Telegraf } = require('telegraf');
 const express = require('express');
 const axios = require('axios');
 const Mega = require('megajs');
+const fs = require('fs');
+const path = require('path');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
@@ -14,7 +16,9 @@ let megaStorage = null;  // Store MEGA connection
 let isLoggedIn = false;  // Track login state
 let awaitingEmail = false;
 let awaitingPassword = false;
+let awaitingRename = false;
 let email = "";
+let rename = "";
 
 // Set webhook for Telegram bot
 bot.telegram.setWebhook(`${WEBHOOK_URL}/bot`);
@@ -55,7 +59,7 @@ bot.on('text', async (ctx) => {
     megaStorage.on('ready', () => {
       isLoggedIn = true;
       awaitingPassword = false;
-      ctx.reply("You are now logged in to MEGA! Send a file link or attachment to upload.");
+      ctx.reply("You are now logged in to MEGA! Send a file link or attachment to upload, or type 'rename' to specify a custom name.");
     });
 
     megaStorage.on('error', (error) => {
@@ -63,25 +67,49 @@ bot.on('text', async (ctx) => {
       ctx.reply("Login failed. Please use /start to try again.");
       isLoggedIn = false;
     });
+  } else if (text.toLowerCase() === 'rename') {
+    awaitingRename = true;
+    ctx.reply("Please enter the new name you want for the uploaded file:");
+  } else if (awaitingRename) {
+    rename = text;
+    awaitingRename = false;
+    ctx.reply(`New file name set to: ${rename}`);
   } else if (isLoggedIn && text.startsWith('http')) {
-    // Upload a file from link
     ctx.reply("Fetching file details...");
 
     try {
       const response = await axios.head(text); // Get file metadata without downloading
       const fileSize = parseInt(response.headers['content-length'], 10);
-      const filename = text.split('/').pop();
+      const originalFilename = text.split('/').pop();
+      const filename = rename || originalFilename; // Use renamed file or original filename
 
       if (!fileSize || isNaN(fileSize)) {
         ctx.reply("Error: Unable to retrieve file size. Please check the link and try again.");
         return;
       }
 
-      ctx.reply("Uploading link to MEGA...");
+      ctx.reply("Starting download...");
 
-      // Now start streaming the file
+      // Start streaming the file
       const downloadResponse = await axios.get(text, { responseType: 'stream' });
+      let downloadedBytes = 0;
+      let startTime = Date.now();
+
       const upload = megaStorage.upload({ name: filename, size: fileSize });
+
+      downloadResponse.data.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        const percentage = ((downloadedBytes / fileSize) * 100).toFixed(2);
+        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+        const speed = (downloadedBytes / elapsedTime / 1024).toFixed(2); // KB/s
+
+        ctx.telegram.editMessageText(
+          ctx.chat.id,
+          ctx.message.message_id,
+          undefined,
+          `Download Progress: ${percentage}% (${speed} KB/s)`
+        );
+      });
 
       downloadResponse.data.pipe(upload);
 
@@ -115,18 +143,36 @@ bot.on('document', async (ctx) => {
 
     const response = await axios.head(fileLink); // Get file metadata
     const fileSize = parseInt(response.headers['content-length'], 10);
-    const filename = ctx.message.document.file_name;
+    const originalFilename = ctx.message.document.file_name;
+    const filename = rename || originalFilename;
 
     if (!fileSize || isNaN(fileSize)) {
       ctx.reply("Error: Unable to retrieve file size. Please try again.");
       return;
     }
 
-    ctx.reply("Uploading file to MEGA...");
+    ctx.reply("Starting upload to MEGA...");
+
+    let uploadedBytes = 0;
+    let startTime = Date.now();
 
     // Stream file to MEGA
     const downloadResponse = await axios.get(fileLink, { responseType: 'stream' });
     const upload = megaStorage.upload({ name: filename, size: fileSize });
+
+    downloadResponse.data.on('data', (chunk) => {
+      uploadedBytes += chunk.length;
+      const percentage = ((uploadedBytes / fileSize) * 100).toFixed(2);
+      const elapsedTime = (Date.now() - startTime) / 1000;
+      const speed = (uploadedBytes / elapsedTime / 1024).toFixed(2); // KB/s
+
+      ctx.telegram.editMessageText(
+        ctx.chat.id,
+        ctx.message.message_id,
+        undefined,
+        `Upload Progress: ${percentage}% (${speed} KB/s)`
+      );
+    });
 
     downloadResponse.data.pipe(upload);
 
